@@ -1139,7 +1139,6 @@ mod tests {
     use crate::buffer::LanceBuffer;
     use crate::constants::MINICHUNK_SIZE_META_KEY;
     use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
-    use crate::encodings::logical::primitive::miniblock::MiniBlockCompressed;
     use crate::statistics::ComputeStat;
     use crate::testing::extract_array_encoding_chain;
     use arrow_schema::{DataType, Field as ArrowField};
@@ -1153,20 +1152,9 @@ mod tests {
         field
     }
 
-    fn chunk_value_counts(compressed: &MiniBlockCompressed) -> Vec<u64> {
-        let mut values_before = 0;
-        compressed
-            .chunks
-            .iter()
-            .map(|chunk| {
-                let chunk_values = chunk.num_values(values_before, compressed.num_values);
-                values_before += chunk_values;
-                chunk_values
-            })
-            .collect()
-    }
-
-    fn chunk_byte_sizes(compressed: &MiniBlockCompressed) -> Vec<u64> {
+    fn chunk_byte_sizes(
+        compressed: &crate::encodings::logical::primitive::miniblock::MiniBlockCompressed,
+    ) -> Vec<u64> {
         compressed
             .chunks
             .iter()
@@ -1797,38 +1785,23 @@ mod tests {
     }
 
     #[test]
-    fn test_field_metadata_miniblock_limits_allow_larger_v2_2_chunks() {
+    fn test_field_metadata_miniblock_max_values_rejects_v2_2_oversize() {
         let strategy = DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_2);
         let mut field = create_test_field("bytes", DataType::UInt8);
         field.metadata.insert(
             MINIBLOCK_MAX_VALUES_META_KEY.to_string(),
             "8192".to_string(),
         );
-        field
-            .metadata
-            .insert(MINIBLOCK_MAX_BYTES_META_KEY.to_string(), "8192".to_string());
 
         let data = create_fixed_width_block(8, 10_000);
-        let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
-        let (compressed, _) = compressor.compress(data).unwrap();
+        let error = strategy
+            .create_miniblock_compressor(&field, &data)
+            .unwrap_err();
 
-        let chunk_values = chunk_value_counts(&compressed);
-        let chunk_bytes = chunk_byte_sizes(&compressed);
-
-        assert!(chunk_values.len() > 1);
-        assert_eq!(chunk_values[0], 8192);
-        assert!(
-            chunk_values
-                .iter()
-                .take(chunk_values.len().saturating_sub(1))
-                .all(|&chunk_values| chunk_values <= 8192)
-        );
-        assert!(
-            chunk_bytes
-                .iter()
-                .take(chunk_bytes.len().saturating_sub(1))
-                .all(|&chunk_bytes| chunk_bytes <= 8192)
-        );
+        assert!(matches!(error, LanceError::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(message.contains("miniblock-max-values 8192 exceeds the limit 4096"));
+        assert!(message.contains("field 'bytes'"));
     }
 
     #[test]
@@ -1854,6 +1827,32 @@ mod tests {
                 .take(chunk_bytes.len().saturating_sub(1))
                 .all(|&chunk_bytes| chunk_bytes <= 256),
             "expected non-final chunks to respect min(minichunk-size, miniblock-max-bytes), got {chunk_bytes:?}"
+        );
+    }
+
+    #[test]
+    fn test_field_metadata_miniblock_byte_limit_overrides_larger_minichunk_size() {
+        let strategy = DefaultCompressionStrategy::new();
+        let mut field = create_test_field("bytes", DataType::Binary);
+        field
+            .metadata
+            .insert(MINIBLOCK_MAX_BYTES_META_KEY.to_string(), "256".to_string());
+        field
+            .metadata
+            .insert(MINICHUNK_SIZE_META_KEY.to_string(), "512".to_string());
+
+        let data = create_variable_width_block(32, 256, 24);
+        let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+        let (compressed, _) = compressor.compress(data).unwrap();
+        let chunk_bytes = chunk_byte_sizes(&compressed);
+
+        assert!(chunk_bytes.len() > 1);
+        assert!(
+            chunk_bytes
+                .iter()
+                .take(chunk_bytes.len().saturating_sub(1))
+                .all(|&chunk_bytes| chunk_bytes <= 256),
+            "expected non-final chunks to respect miniblock-max-bytes when it is smaller than minichunk-size, got {chunk_bytes:?}"
         );
     }
 

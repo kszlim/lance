@@ -197,15 +197,19 @@ fn search_next_offset_idx<N: OffsetSizeTrait>(
 
 impl BinaryMiniBlockEncoder {
     pub fn new(minichunk_size: Option<i64>) -> Self {
-        Self {
-            minichunk_size: minichunk_size.unwrap_or(*AIM_MINICHUNK_SIZE),
-            limits: MiniBlockLimits::default(),
-        }
+        Self::with_limits(minichunk_size, MiniBlockLimits::default())
     }
 
     pub(crate) fn with_limits(minichunk_size: Option<i64>, limits: MiniBlockLimits) -> Self {
+        let minichunk_size = minichunk_size.unwrap_or(*AIM_MINICHUNK_SIZE);
+        let max_limit = i64::try_from(limits.max_bytes).unwrap_or(i64::MAX);
+        let minichunk_size = if minichunk_size > 0 {
+            minichunk_size.min(max_limit)
+        } else {
+            minichunk_size
+        };
         Self {
-            minichunk_size: minichunk_size.unwrap_or(*AIM_MINICHUNK_SIZE),
+            minichunk_size,
             limits,
         }
     }

@@ -586,7 +586,7 @@ is typically less affected by the compression level.
 The mini-block encoders expose three advanced sizing knobs through field metadata:
 
 - `lance-encoding:miniblock-max-values` caps the number of values in a non-final mini-block chunk. The default is
-  4,096 values. Lance 2.1 and earlier cap this at 4,096. Lance 2.2 and later cap this at 16,384.
+  4,096 values.
 - `lance-encoding:miniblock-max-bytes` caps the pre-serialization value-buffer budget for a mini-block chunk. The
   default is 8,186 bytes.
 - `lance-encoding:minichunk-size` applies an additional byte ceiling for variable-width mini-blocks. The default is

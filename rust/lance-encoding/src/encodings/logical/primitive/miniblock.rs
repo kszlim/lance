@@ -27,8 +27,6 @@ pub const MAX_MINIBLOCK_BYTES: u64 = 8 * 1024 - 6;
 ///
 /// This remains the default when users do not specify any miniblock tuning metadata.
 pub const MAX_MINIBLOCK_VALUES: u64 = 4096;
-/// Maximum miniblock values supported by the current metadata layout in Lance 2.2+.
-const MAX_MINIBLOCK_VALUES_V2_2: u64 = 16 * 1024;
 /// Maximum serialized miniblock size in Lance 2.1 and earlier.
 const MAX_MINIBLOCK_SERIALIZED_BYTES_V2_1: u64 = 32 * 1024;
 /// Maximum serialized miniblock size in Lance 2.2+.
@@ -108,19 +106,13 @@ impl MiniBlockLimits {
     }
 
     pub fn max_values_for_version(version: LanceFileVersion) -> u64 {
-        if version >= LanceFileVersion::V2_2 {
-            MAX_MINIBLOCK_VALUES_V2_2
-        } else {
-            MAX_MINIBLOCK_VALUES
-        }
+        let _ = version;
+        MAX_MINIBLOCK_VALUES
     }
 
     pub fn max_log_num_values(version: LanceFileVersion) -> u8 {
-        if version >= LanceFileVersion::V2_2 {
-            14
-        } else {
-            12
-        }
+        let _ = version;
+        12
     }
 
     pub fn max_serialized_chunk_bytes(version: LanceFileVersion) -> u64 {
@@ -223,10 +215,13 @@ mod tests {
     }
 
     #[test]
-    fn test_miniblock_limits_v2_2_allows_larger_value_cap() {
-        let limits = MiniBlockLimits::try_new(LanceFileVersion::V2_2, Some(12_000), None)
-            .expect("v2.2 should allow values above 4096");
-        assert_eq!(limits.max_values, 12_000);
-        assert_eq!(limits.max_non_last_chunk_values(), 8192);
+    fn test_miniblock_limits_v2_2_caps_values() {
+        let error = MiniBlockLimits::try_new(LanceFileVersion::V2_2, Some(8192), None)
+            .expect_err("v2.2 should reject values above 4096");
+        assert!(
+            error
+                .to_string()
+                .contains("miniblock-max-values 8192 exceeds the limit 4096")
+        );
     }
 }
