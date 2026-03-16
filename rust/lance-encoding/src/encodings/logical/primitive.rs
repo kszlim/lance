@@ -50,11 +50,14 @@ use crate::{
     encodings::logical::primitive::fullzip::PerValueDataBlock,
 };
 use crate::{
-    encodings::logical::primitive::miniblock::MiniBlockChunk, utils::bytepack::ByteUnpacker,
-};
-use crate::{
     encodings::logical::primitive::miniblock::MiniBlockCompressed,
     statistics::{ComputeStat, GetStat, Stat},
+};
+use crate::{
+    encodings::logical::primitive::miniblock::{
+        MAX_MINIBLOCK_LEVEL_BUFFER_BYTES, MiniBlockChunk, MiniBlockLimits,
+    },
+    utils::bytepack::ByteUnpacker,
 };
 use crate::{
     repdef::{
@@ -3798,7 +3801,7 @@ impl PrimitiveStructuralEncoder {
         rep: Option<Vec<CompressedLevelsChunk>>,
         def: Option<Vec<CompressedLevelsChunk>>,
         support_large_chunk: bool,
-    ) -> SerializedMiniBlockPage {
+    ) -> Result<SerializedMiniBlockPage> {
         let bytes_rep = rep
             .as_ref()
             .map(|rep| rep.iter().map(|r| r.data.len()).sum::<usize>())
@@ -3842,11 +3845,23 @@ impl PrimitiveStructuralEncoder {
 
             // Write the buffer lengths
             if let Some(rep) = rep.as_ref() {
-                let bytes_rep = u16::try_from(rep.data.len()).unwrap();
+                let bytes_rep = u16::try_from(rep.data.len()).map_err(|_| {
+                    lance_core::Error::invalid_input(format!(
+                        "miniblock repetition buffer has {} bytes which exceeds the {}-byte header limit",
+                        rep.data.len(),
+                        MAX_MINIBLOCK_LEVEL_BUFFER_BYTES
+                    ))
+                })?;
                 data_buffer.extend_from_slice(&bytes_rep.to_le_bytes());
             }
             if let Some(def) = def.as_ref() {
-                let bytes_def = u16::try_from(def.data.len()).unwrap();
+                let bytes_def = u16::try_from(def.data.len()).map_err(|_| {
+                    lance_core::Error::invalid_input(format!(
+                        "miniblock definition buffer has {} bytes which exceeds the {}-byte header limit",
+                        def.data.len(),
+                        MAX_MINIBLOCK_LEVEL_BUFFER_BYTES
+                    ))
+                })?;
                 data_buffer.extend_from_slice(&bytes_def.to_le_bytes());
             }
 
@@ -3856,7 +3871,12 @@ impl PrimitiveStructuralEncoder {
                 }
             } else {
                 for &buffer_size in &chunk.buffer_sizes {
-                    data_buffer.extend_from_slice(&(buffer_size as u16).to_le_bytes());
+                    let buffer_size = u16::try_from(buffer_size).map_err(|_| {
+                        lance_core::Error::invalid_input(format!(
+                            "miniblock value buffer has {buffer_size} bytes which exceeds the u16 header limit for file version 2.1"
+                        ))
+                    })?;
+                    data_buffer.extend_from_slice(&buffer_size.to_le_bytes());
                 }
             }
 
@@ -3889,16 +3909,35 @@ impl PrimitiveStructuralEncoder {
             }
 
             let chunk_bytes = data_buffer.len() - start_pos;
-            let max_chunk_size = if support_large_chunk {
-                4 * 1024 * 1024 * 1024 // 4GB limit with u32 metadata
+            let version = if support_large_chunk {
+                LanceFileVersion::V2_2
             } else {
-                32 * 1024 // 32KiB limit with u16 metadata
+                LanceFileVersion::V2_1
             };
-            assert!(chunk_bytes <= max_chunk_size);
-            assert!(chunk_bytes > 0);
-            assert_eq!(chunk_bytes % 8, 0);
-            // 4Ki values max
-            assert!(chunk.log_num_values <= 12);
+            let max_chunk_size = MiniBlockLimits::max_serialized_chunk_bytes(version);
+            if chunk_bytes as u64 > max_chunk_size {
+                return Err(lance_core::Error::invalid_input(format!(
+                    "serialized miniblock chunk has {chunk_bytes} bytes which exceeds the {}-byte limit for file version {}",
+                    max_chunk_size, version
+                )));
+            }
+            if chunk_bytes == 0 {
+                return Err(lance_core::Error::invalid_input(
+                    "serialized miniblock chunk must contain at least one byte".to_string(),
+                ));
+            }
+            if chunk_bytes % 8 != 0 {
+                return Err(lance_core::Error::invalid_input(format!(
+                    "serialized miniblock chunk has {chunk_bytes} bytes which is not 8-byte aligned"
+                )));
+            }
+            let max_log_num_values = MiniBlockLimits::max_log_num_values(version);
+            if chunk.log_num_values > max_log_num_values {
+                return Err(lance_core::Error::invalid_input(format!(
+                    "miniblock chunk log_num_values {} exceeds the limit {} for file version {}",
+                    chunk.log_num_values, max_log_num_values, version
+                )));
+            }
             // We subtract 1 here from chunk_bytes because we want to be able to express
             // a size of 32KiB and not (32Ki - 8)B which is what we'd get otherwise with
             // 0xFFF
@@ -3916,11 +3955,11 @@ impl PrimitiveStructuralEncoder {
         let data_buffer = LanceBuffer::from(data_buffer);
         let metadata_buffer = LanceBuffer::from(meta_buffer);
 
-        SerializedMiniBlockPage {
+        Ok(SerializedMiniBlockPage {
             num_buffers: miniblocks.data.len() as u64,
             data: data_buffer,
             metadata: metadata_buffer,
-        }
+        })
     }
 
     /// Compresses a buffer of levels into chunks
@@ -4448,7 +4487,7 @@ impl PrimitiveStructuralEncoder {
             .map(|cd| std::mem::take(&mut cd.data));
 
         let serialized =
-            Self::serialize_miniblocks(compressed_data, rep_data, def_data, support_large_chunk);
+            Self::serialize_miniblocks(compressed_data, rep_data, def_data, support_large_chunk)?;
 
         // Metadata, Data, Dictionary, (maybe) Repetition Index
         let mut data = Vec::with_capacity(4);
@@ -5305,7 +5344,8 @@ mod tests {
     use crate::compression::DefaultDecompressionStrategy;
     use crate::constants::{
         COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_VALUES_COMPRESSION_LEVEL_META_KEY,
-        DICT_VALUES_COMPRESSION_META_KEY, STRUCTURAL_ENCODING_META_KEY,
+        DICT_VALUES_COMPRESSION_META_KEY, MINIBLOCK_MAX_BYTES_META_KEY,
+        MINIBLOCK_MAX_VALUES_META_KEY, MINICHUNK_SIZE_META_KEY, STRUCTURAL_ENCODING_META_KEY,
         STRUCTURAL_ENCODING_MINIBLOCK,
     };
     use crate::data::BlockInfo;
@@ -5318,7 +5358,7 @@ mod tests {
     use crate::format::pb21::compressive_encoding::Compression;
     use crate::testing::{TestCases, check_round_trip_encoding_of_data};
     use crate::version::LanceFileVersion;
-    use arrow_array::{ArrayRef, Int8Array, StringArray};
+    use arrow_array::{ArrayRef, Int8Array, Int32Array, StringArray};
     use arrow_schema::DataType;
     use std::collections::HashMap;
     use std::{collections::VecDeque, sync::Arc};
@@ -6422,18 +6462,24 @@ mod tests {
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, metadata).await
     }
 
+    async fn test_miniblock_metadata_helper(
+        arrays: Vec<ArrayRef>,
+        metadata: HashMap<String, String>,
+        file_version: LanceFileVersion,
+    ) {
+        let test_cases = TestCases::default()
+            .with_min_file_version(file_version)
+            .with_batch_size(1000);
+
+        check_round_trip_encoding_of_data(arrays, &test_cases, metadata).await;
+    }
+
     async fn test_minichunk_size_helper(
         string_data: Vec<Option<String>>,
         minichunk_size: u64,
         file_version: LanceFileVersion,
     ) {
-        use crate::constants::MINICHUNK_SIZE_META_KEY;
-        use crate::testing::{TestCases, check_round_trip_encoding_of_data};
-        use arrow_array::{ArrayRef, StringArray};
-        use std::sync::Arc;
-
         let string_array: ArrayRef = Arc::new(StringArray::from(string_data));
-
         let mut metadata = HashMap::new();
         metadata.insert(
             MINICHUNK_SIZE_META_KEY.to_string(),
@@ -6444,11 +6490,7 @@ mod tests {
             STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
         );
 
-        let test_cases = TestCases::default()
-            .with_min_file_version(file_version)
-            .with_batch_size(1000);
-
-        check_round_trip_encoding_of_data(vec![string_array], &test_cases, metadata).await;
+        test_miniblock_metadata_helper(vec![string_array], metadata, file_version).await;
     }
 
     #[tokio::test]
@@ -6481,6 +6523,41 @@ mod tests {
             string_data.push(Some(format!("t_{}", i)));
         }
         test_minichunk_size_helper(string_data, 128 * 1024, LanceFileVersion::V2_2).await;
+    }
+
+    #[tokio::test]
+    async fn test_miniblock_limits_roundtrip_fixed_width() {
+        let values: Vec<i32> = (0..5000).collect();
+        let array: ArrayRef = Arc::new(Int32Array::from(values));
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
+        );
+        metadata.insert(MINIBLOCK_MAX_VALUES_META_KEY.to_string(), "512".to_string());
+        metadata.insert(MINIBLOCK_MAX_BYTES_META_KEY.to_string(), "2048".to_string());
+
+        test_miniblock_metadata_helper(vec![array], metadata, LanceFileVersion::V2_1).await;
+    }
+
+    #[tokio::test]
+    async fn test_miniblock_limits_roundtrip_variable_width() {
+        let string_data: Vec<Option<String>> = (0..2048)
+            .map(|i| Some(format!("value_{i:04}_{}", "x".repeat((i % 7 + 1) * 16))))
+            .collect();
+        let string_array: ArrayRef = Arc::new(StringArray::from(string_data));
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
+        );
+        metadata.insert(MINICHUNK_SIZE_META_KEY.to_string(), "512".to_string());
+        metadata.insert(MINIBLOCK_MAX_VALUES_META_KEY.to_string(), "128".to_string());
+        metadata.insert(MINIBLOCK_MAX_BYTES_META_KEY.to_string(), "1024".to_string());
+
+        test_miniblock_metadata_helper(vec![string_array], metadata, LanceFileVersion::V2_1).await;
     }
 
     #[tokio::test]

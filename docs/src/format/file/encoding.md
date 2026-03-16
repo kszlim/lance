@@ -534,8 +534,8 @@ However, general compression is highly effective and we allow it to be opted int
 
 ## Compression Configuration
 
-The following section lists the available configuration options. These can be set programmatically through writer
-options. However, they can also be set in the field metadata in the schema.
+The following section lists the available configuration options. Depending on the setting, these can be set through
+writer options, field metadata in the schema, or both.
 
 | Key                                  | Values                               | Default          | Description                                                                             |
 | ------------------------------------ | ------------------------------------ | ---------------- | --------------------------------------------------------------------------------------- |
@@ -543,6 +543,9 @@ options. However, they can also be set in the field metadata in the schema.
 | `lance-encoding:compression-level`   | Integers (range is scheme dependent) | Varies by scheme | Higher indicates more work should be done to compress the data.                         |
 | `lance-encoding:rle-threshold`       | `0.0-1.0`                            | `0.5`            | See below                                                                               |
 | `lance-encoding:bss`                 | `off`, `on`, `auto`                  | `auto`           | See below                                                                               |
+| `lance-encoding:minichunk-size`      | Positive integers                    | `4096`           | Variable-width mini-block byte target. See below                                        |
+| `lance-encoding:miniblock-max-values` | Integers >= 2                       | `4096`           | Mini-block value-count ceiling. See below                                               |
+| `lance-encoding:miniblock-max-bytes` | Positive integers                    | `8186`           | Mini-block value-buffer byte ceiling. See below                                         |
 | `lance-encoding:dict-divisor`        | Integers greater than 1              | `2`              | See below                                                                               |
 | `lance-encoding:dict-size-ratio`     | `0.0-1.0`                            | `0.8`            | See below                                                                               |
 | `lance-encoding:dict-values-compression` | `lz4`, `zstd`, `none`             | `lz4`            | Select general compression scheme for dictionary values                                 |
@@ -578,6 +581,31 @@ The compression level is scheme dependent. Currently the following schemes suppo
 Higher compression levels generally provide better compression at the cost of slower encoding speed. Decoding speed
 is typically less affected by the compression level.
 
+#### Mini-Block Sizing
+
+The mini-block encoders expose three advanced sizing knobs through field metadata:
+
+- `lance-encoding:miniblock-max-values` caps the number of values in a non-final mini-block chunk. The default is
+  4,096 values. Lance 2.1 and earlier cap this at 4,096. Lance 2.2 and later cap this at 16,384.
+- `lance-encoding:miniblock-max-bytes` caps the pre-serialization value-buffer budget for a mini-block chunk. The
+  default is 8,186 bytes.
+- `lance-encoding:minichunk-size` applies an additional byte ceiling for variable-width mini-blocks. The default is
+  4,096 bytes.
+
+For fixed-width mini-blocks, Lance chooses the largest power-of-two number of values that fits within both the
+configured value ceiling and byte ceiling. Final chunks can be smaller.
+
+For variable-width mini-blocks, Lance walks the values until the next value would exceed the byte ceiling and then
+uses the most recent power-of-two number of values. When both `minichunk-size` and `miniblock-max-bytes` are set,
+Lance uses the smaller of the two byte ceilings.
+
+Variable-width mini-blocks still avoid 1-value non-final chunks because `log_num_values = 0` is reserved for the
+final chunk. If the configured byte ceiling is too small to fit even the minimum valid non-final chunk, Lance keeps
+the existing best-effort behavior and emits a 2-value chunk.
+
+Inline bitpacking still requires 1,024-value mini-blocks. If the configured limits make that impossible, Lance falls
+back to another compatible mini-block encoder instead of treating bitpacking as a special case.
+
 #### Run Length Encoding (RLE) Threshold
 
 The RLE threshold is used to determine whether or not to apply run-length encoding. The threshold is a ratio
@@ -588,7 +616,7 @@ is less than half the number of values.
 **Key points:**
 - RLE is automatically selected when data has sufficient repetition (run_count / num_values < threshold)
 - Supported types: All fixed-width primitives (u8, i8, u16, i16, u32, i32, f32, u64, i64, f64)
-- Maximum chunk size: 2048 values per mini-block
+- Chunk size is bounded by the configured mini-block ceilings (defaults: 4,096 values and 8,186 bytes)
 - Setting threshold to `0.0` effectively disables RLE
 - Setting threshold to `1.0` makes RLE very aggressive (used whenever any runs exist)
 
@@ -608,7 +636,7 @@ BSS is a data transformation that makes floating-point data more compressible; i
 
 **Key points:**
 - Supported types: Only 32-bit and 64-bit data (f32, f64, timestamps)
-- Maximum chunk sizes: 1024 values (f32), 512 values (f64)
+- Default maximum chunk sizes: 1024 values (f32), 512 values (f64)
 - `auto` mode: Uses entropy analysis with 0.5 sensitivity threshold
 - `on` mode: Always applies BSS for supported types
 - `off` mode: Never applies BSS
