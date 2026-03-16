@@ -798,7 +798,7 @@ pub mod tests {
                 "zstd".to_string(),
             )])),
             LanceFileVersion::V2_1,
-            "BinaryEncoder { indices_encoder: BasicEncoder { values_encoder: ValueEncoder }, compression_config: Some(CompressionConfig { scheme: Zstd, level: None }), buffer_compressor: Some(ZstdBufferCompressor { compression_level: 0 }) }",
+            "BinaryEncoder { indices_encoder: BasicEncoder { values_encoder: ValueEncoder { limits: MiniBlockLimits { max_bytes: 8186, max_values: 4096 } } }, compression_config: Some(CompressionConfig { scheme: Zstd, level: None }), buffer_compressor: Some(ZstdBufferCompressor { compression_level: 0 }) }",
         );
     }
 
@@ -811,7 +811,7 @@ pub mod tests {
                 (COMPRESSION_LEVEL_META_KEY.to_string(), "22".to_string()),
             ])),
             LanceFileVersion::V2_1,
-            "BinaryEncoder { indices_encoder: BasicEncoder { values_encoder: ValueEncoder }, compression_config: Some(CompressionConfig { scheme: Zstd, level: Some(22) }), buffer_compressor: Some(ZstdBufferCompressor { compression_level: 22 }) }",
+            "BinaryEncoder { indices_encoder: BasicEncoder { values_encoder: ValueEncoder { limits: MiniBlockLimits { max_bytes: 8186, max_values: 4096 } } }, compression_config: Some(CompressionConfig { scheme: Zstd, level: Some(22) }), buffer_compressor: Some(ZstdBufferCompressor { compression_level: 22 }) }",
         );
     }
 }

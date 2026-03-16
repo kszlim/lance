@@ -288,6 +288,26 @@ def test_schema_metadata(tmp_path: Path):
     assert ds.schema.field("b").metadata == {b"thisis": b"b"}
 
 
+def test_miniblock_field_metadata_roundtrip(tmp_path: Path):
+    field = pa.field(
+        "payload",
+        pa.binary(),
+        metadata={
+            b"lance-encoding:structural-encoding": b"miniblock",
+            b"lance-encoding:minichunk-size": b"1024",
+            b"lance-encoding:miniblock-max-values": b"128",
+            b"lance-encoding:miniblock-max-bytes": b"512",
+        },
+    )
+    values = [bytes([i % 251]) * (16 + (i % 5) * 8) for i in range(2048)]
+    table = pa.Table.from_arrays([pa.array(values, pa.binary())], schema=pa.schema([field]))
+
+    ds = lance.write_dataset(table, tmp_path, data_storage_version="2.2")
+
+    assert ds.schema.field("payload").metadata == field.metadata
+    assert ds.to_table() == table
+
+
 def test_versions(tmp_path: Path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     base_dir = tmp_path / "test"

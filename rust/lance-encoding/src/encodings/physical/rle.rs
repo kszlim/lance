@@ -46,8 +46,9 @@
 //! Each chunk's `buffer_sizes` identifies its slice within those global buffers. Non-last chunks
 //! contain a power-of-2 number of values.
 //!
-//! NOTE: The current encoder uses a 2048-value cap per chunk as a workaround for
-//! <https://github.com/lancedb/lance/issues/4429>.
+//! NOTE: The current encoder uses the resolved miniblock limits for chunk sizing, which
+//! default to 4,096 values and 8,186 bytes per chunk.  These defaults can be overridden
+//! through field metadata.
 //!
 //! ## Block Format
 //!
@@ -62,8 +63,7 @@ use crate::compression::{BlockCompressor, BlockDecompressor, MiniBlockDecompress
 use crate::data::DataBlock;
 use crate::data::{BlockInfo, FixedWidthDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
-    MAX_MINIBLOCK_BYTES, MAX_MINIBLOCK_VALUES, MiniBlockChunk, MiniBlockCompressed,
-    MiniBlockCompressor,
+    MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor, MiniBlockLimits,
 };
 use crate::format::ProtobufUtils21;
 use crate::format::pb21::CompressiveEncoding;
@@ -71,12 +71,18 @@ use crate::format::pb21::CompressiveEncoding;
 use lance_core::{Error, Result};
 
 /// RLE encoder for miniblock format
-#[derive(Debug, Default)]
-pub struct RleEncoder;
+#[derive(Debug, Clone, Copy)]
+pub struct RleEncoder {
+    limits: MiniBlockLimits,
+}
 
 impl RleEncoder {
     pub fn new() -> Self {
-        Self
+        Self::with_limits(MiniBlockLimits::default())
+    }
+
+    pub(crate) fn with_limits(limits: MiniBlockLimits) -> Self {
+        Self { limits }
     }
 
     fn encode_data(
@@ -182,7 +188,7 @@ impl RleEncoder {
     /// should be the last chunk based on how many values were processed.
     ///
     /// # Key Features:
-    /// - Tracks byte usage to ensure we don't exceed MAX_MINIBLOCK_BYTES
+    /// - Tracks byte usage to ensure we don't exceed the configured miniblock byte ceiling
     /// - Maintains power-of-2 checkpoints for non-last chunks
     /// - Splits long runs (>255) into multiple entries
     /// - Dynamically determines if this is the last chunk
@@ -205,7 +211,7 @@ impl RleEncoder {
         let type_size = std::mem::size_of::<T>();
 
         let chunk_start = offset * type_size;
-        let max_by_count = MAX_MINIBLOCK_VALUES as usize;
+        let max_by_count = self.limits.max_values as usize;
         let max_values = values_remaining.min(max_by_count);
         let chunk_end = chunk_start + max_values * type_size;
 
@@ -233,15 +239,16 @@ impl RleEncoder {
         // Power-of-2 checkpoints for ensuring non-last chunks have valid sizes.
         //
         // We start from a slightly larger minimum checkpoint for smaller types since
-        // they encode more compactly and are less likely to hit MAX_MINIBLOCK_BYTES.
+        // they encode more compactly and are less likely to hit the byte ceiling.
         let min_checkpoint_log2 = match type_size {
             1 => 8, // 256
             2 => 7, // 128
             _ => 6, // 64
         };
-        let max_checkpoint_log2 = (values_remaining.min(MAX_MINIBLOCK_VALUES as usize))
-            .next_power_of_two()
-            .ilog2();
+        let max_checkpoint_log2 = (values_remaining
+            .min(self.limits.max_non_last_chunk_values() as usize))
+        .next_power_of_two()
+        .ilog2();
         let mut checkpoint_log2 = min_checkpoint_log2;
 
         // Save state at checkpoints so we can roll back if needed
@@ -256,7 +263,7 @@ impl RleEncoder {
                 let bytes_needed = run_chunks * (type_size + 1);
 
                 // Stop if adding this run would exceed byte limit
-                if bytes_used + bytes_needed > MAX_MINIBLOCK_BYTES as usize {
+                if bytes_used + bytes_needed > self.limits.max_bytes as usize {
                     if let Some((val_pos, len_pos, _, checkpoint_values)) = last_checkpoint_state {
                         // Roll back to last power-of-2 checkpoint
                         all_values.truncate(val_pos);
@@ -296,7 +303,7 @@ impl RleEncoder {
             let run_chunks = current_length.div_ceil(255) as usize;
             let bytes_needed = run_chunks * (type_size + 1);
 
-            if bytes_used + bytes_needed <= MAX_MINIBLOCK_BYTES as usize {
+            if bytes_used + bytes_needed <= self.limits.max_bytes as usize {
                 let _ = self.add_run(&current_value, current_length, all_values, all_lengths);
                 total_values_encoded += current_length as usize;
             }
@@ -355,6 +362,12 @@ impl RleEncoder {
         }
 
         total_chunks * (type_size + 1)
+    }
+}
+
+impl Default for RleEncoder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

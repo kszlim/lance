@@ -27,7 +27,7 @@ use crate::{
     },
     encodings::logical::primitive::{
         fullzip::{PerValueCompressor, PerValueDataBlock},
-        miniblock::{MiniBlockCompressed, MiniBlockCompressor},
+        miniblock::{MiniBlockCompressed, MiniBlockCompressor, MiniBlockLimits},
     },
     format::{
         ProtobufUtils21,
@@ -69,8 +69,22 @@ fn struct_data_block_to_fixed_width_data_block(
     })
 }
 
-#[derive(Debug, Default)]
-pub struct PackedStructFixedWidthMiniBlockEncoder {}
+#[derive(Debug, Clone, Copy)]
+pub struct PackedStructFixedWidthMiniBlockEncoder {
+    limits: MiniBlockLimits,
+}
+
+impl PackedStructFixedWidthMiniBlockEncoder {
+    pub(crate) fn new(limits: MiniBlockLimits) -> Self {
+        Self { limits }
+    }
+}
+
+impl Default for PackedStructFixedWidthMiniBlockEncoder {
+    fn default() -> Self {
+        Self::new(MiniBlockLimits::default())
+    }
+}
 
 impl MiniBlockCompressor for PackedStructFixedWidthMiniBlockEncoder {
     fn compress(&self, data: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
@@ -82,7 +96,9 @@ impl MiniBlockCompressor for PackedStructFixedWidthMiniBlockEncoder {
                 let data_block = struct_data_block_to_fixed_width_data_block(struct_data_block, &bits_per_values);
 
                 // store and transformed fixed-width data block.
-                let value_miniblock_compressor = Box::new(ValueEncoder::default()) as Box<dyn MiniBlockCompressor>;
+                let value_miniblock_compressor =
+                    Box::new(ValueEncoder::with_limits(self.limits))
+                        as Box<dyn MiniBlockCompressor>;
                 let (value_miniblock_compressed, value_array_encoding) =
                 value_miniblock_compressor.compress(data_block)?;
 

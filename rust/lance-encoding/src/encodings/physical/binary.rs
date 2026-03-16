@@ -21,7 +21,7 @@ use crate::buffer::LanceBuffer;
 use crate::data::{BlockInfo, DataBlock, VariableWidthBlock};
 use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
-    MAX_MINIBLOCK_VALUES, MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor,
+    MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor, MiniBlockLimits,
 };
 use crate::format::pb21::CompressiveEncoding;
 use crate::format::pb21::compressive_encoding::Compression;
@@ -33,12 +33,14 @@ use lance_core::{Error, Result};
 #[derive(Debug)]
 pub struct BinaryMiniBlockEncoder {
     minichunk_size: i64,
+    limits: MiniBlockLimits,
 }
 
 impl Default for BinaryMiniBlockEncoder {
     fn default() -> Self {
         Self {
             minichunk_size: *AIM_MINICHUNK_SIZE,
+            limits: MiniBlockLimits::default(),
         }
     }
 }
@@ -58,7 +60,8 @@ fn chunk_offsets<N: OffsetSizeTrait>(
     data: &[u8],
     alignment: usize,
     minichunk_size: i64,
-) -> (Vec<LanceBuffer>, Vec<MiniBlockChunk>) {
+    limits: MiniBlockLimits,
+) -> Result<(Vec<LanceBuffer>, Vec<MiniBlockChunk>)> {
     #[derive(Debug)]
     struct ChunkInfo {
         chunk_start_offset_in_orig_idx: usize,
@@ -78,7 +81,7 @@ fn chunk_offsets<N: OffsetSizeTrait>(
     let mut last_offset_in_orig_idx = 0;
     loop {
         let this_last_offset_in_orig_idx =
-            search_next_offset_idx(offsets, last_offset_in_orig_idx, minichunk_size);
+            search_next_offset_idx(offsets, last_offset_in_orig_idx, minichunk_size, limits)?;
 
         let num_values_in_this_chunk = this_last_offset_in_orig_idx - last_offset_in_orig_idx;
         let chunk_bytes = offsets[this_last_offset_in_orig_idx] - offsets[last_offset_in_orig_idx];
@@ -146,7 +149,7 @@ fn chunk_offsets<N: OffsetSizeTrait>(
             output.extend(std::iter::repeat_n(PAD_BYTE, pad_len));
         }
     }
-    (vec![LanceBuffer::reinterpret_vec(output)], chunks)
+    Ok((vec![LanceBuffer::reinterpret_vec(output)], chunks))
 }
 
 // search for the next offset index to cut the values into a chunk.
@@ -157,87 +160,105 @@ fn search_next_offset_idx<N: OffsetSizeTrait>(
     offsets: &[N],
     last_offset_idx: usize,
     minichunk_size: i64,
-) -> usize {
+    limits: MiniBlockLimits,
+) -> Result<usize> {
+    let chunk_size_for = |num_values: usize| {
+        let existing_bytes = offsets[last_offset_idx + num_values] - offsets[last_offset_idx];
+        existing_bytes + N::from_usize((num_values + 1) * N::get_byte_width()).unwrap()
+    };
+
     // MiniBlockChunk uses `log_num_values == 0` as a sentinel for the final chunk. This means we
     // must avoid creating 1-value chunks except for the final chunk, even if the configured
     // `minichunk_size` is too small to fit more than one value.
     let remaining_values = offsets.len().saturating_sub(last_offset_idx + 1);
     if remaining_values <= 1 {
-        return offsets.len() - 1;
+        return Ok(offsets.len() - 1);
+    }
+
+    if remaining_values <= limits.max_values as usize
+        && chunk_size_for(remaining_values).to_i64().unwrap() <= minichunk_size
+    {
+        return Ok(offsets.len() - 1);
     }
 
     let mut num_values = 2;
-    let mut new_num_values = num_values * 2;
-    loop {
-        if last_offset_idx + new_num_values >= offsets.len() {
-            let existing_bytes = offsets[offsets.len() - 1] - offsets[last_offset_idx];
-            // existing bytes plus the new offset size
-            let new_size = existing_bytes
-                + N::from_usize((offsets.len() - last_offset_idx) * N::get_byte_width()).unwrap();
-            if new_size.to_i64().unwrap() <= minichunk_size {
-                // case 1: can fit the rest of all data into a miniblock
-                return offsets.len() - 1;
-            } else {
-                // case 2: can only fit the last tried `num_values` into a miniblock
-                return last_offset_idx + num_values;
-            }
-        }
-        let existing_bytes = offsets[last_offset_idx + new_num_values] - offsets[last_offset_idx];
-        let new_size =
-            existing_bytes + N::from_usize((new_num_values + 1) * N::get_byte_width()).unwrap();
-        if new_size.to_i64().unwrap() <= minichunk_size {
-            if new_num_values * 2 > MAX_MINIBLOCK_VALUES as usize {
-                // hit the max number of values limit
-                break;
-            }
-            num_values = new_num_values;
-            new_num_values *= 2;
+    let max_non_last_values = limits.max_non_last_chunk_values() as usize;
+    while num_values * 2 <= max_non_last_values && last_offset_idx + num_values * 2 < offsets.len()
+    {
+        let candidate_values = num_values * 2;
+        if chunk_size_for(candidate_values).to_i64().unwrap() <= minichunk_size {
+            num_values = candidate_values;
         } else {
             break;
         }
     }
-    last_offset_idx + num_values
+    Ok(last_offset_idx + num_values)
 }
 
 impl BinaryMiniBlockEncoder {
     pub fn new(minichunk_size: Option<i64>) -> Self {
+        Self::with_limits(minichunk_size, MiniBlockLimits::default())
+    }
+
+    pub(crate) fn with_limits(minichunk_size: Option<i64>, limits: MiniBlockLimits) -> Self {
+        let minichunk_size = minichunk_size.unwrap_or(*AIM_MINICHUNK_SIZE);
+        let max_limit = i64::try_from(limits.max_bytes).unwrap_or(i64::MAX);
+        let minichunk_size = if minichunk_size > 0 {
+            minichunk_size.min(max_limit)
+        } else {
+            minichunk_size
+        };
         Self {
-            minichunk_size: minichunk_size.unwrap_or(*AIM_MINICHUNK_SIZE),
+            minichunk_size,
+            limits,
         }
     }
 
     // put binary data into chunks, every chunk is less than or equal to `minichunk_size`.
     // In each chunk, offsets are put first then followed by binary bytes data, each chunk is padded to 8 bytes.
     // the offsets in the chunk points to the bytes offset in this chunk.
-    fn chunk_data(&self, data: VariableWidthBlock) -> (MiniBlockCompressed, CompressiveEncoding) {
+    fn chunk_data(
+        &self,
+        data: VariableWidthBlock,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         // TODO: Support compression of offsets
         // TODO: Support general compression of data
         match data.bits_per_offset {
             32 => {
                 let offsets = data.offsets.borrow_to_typed_slice::<i32>();
-                let (buffers, chunks) =
-                    chunk_offsets(offsets.as_ref(), &data.data, 4, self.minichunk_size);
-                (
+                let (buffers, chunks) = chunk_offsets(
+                    offsets.as_ref(),
+                    &data.data,
+                    4,
+                    self.minichunk_size,
+                    self.limits,
+                )?;
+                Ok((
                     MiniBlockCompressed {
                         data: buffers,
                         chunks,
                         num_values: data.num_values,
                     },
                     ProtobufUtils21::variable(ProtobufUtils21::flat(32, None), None),
-                )
+                ))
             }
             64 => {
                 let offsets = data.offsets.borrow_to_typed_slice::<i64>();
-                let (buffers, chunks) =
-                    chunk_offsets(offsets.as_ref(), &data.data, 8, self.minichunk_size);
-                (
+                let (buffers, chunks) = chunk_offsets(
+                    offsets.as_ref(),
+                    &data.data,
+                    8,
+                    self.minichunk_size,
+                    self.limits,
+                )?;
+                Ok((
                     MiniBlockCompressed {
                         data: buffers,
                         chunks,
                         num_values: data.num_values,
                     },
                     ProtobufUtils21::variable(ProtobufUtils21::flat(64, None), None),
-                )
+                ))
             }
             _ => panic!("Unsupported bits_per_offset={}", data.bits_per_offset),
         }
@@ -247,7 +268,7 @@ impl BinaryMiniBlockEncoder {
 impl MiniBlockCompressor for BinaryMiniBlockEncoder {
     fn compress(&self, data: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match data {
-            DataBlock::VariableWidth(variable_width) => Ok(self.chunk_data(variable_width)),
+            DataBlock::VariableWidth(variable_width) => self.chunk_data(variable_width),
             _ => Err(Error::invalid_input_source(
                 format!(
                     "Cannot compress a data block of type {} with BinaryMiniBlockEncoder",

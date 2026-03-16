@@ -62,7 +62,7 @@ use crate::compression::MiniBlockDecompressor;
 use crate::compression_config::BssMode;
 use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
-    MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor,
+    MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor, MiniBlockLimits,
 };
 use crate::format::ProtobufUtils21;
 use crate::format::pb21::CompressiveEncoding;
@@ -78,31 +78,48 @@ use lance_core::Result;
 #[derive(Debug, Clone)]
 pub struct ByteStreamSplitEncoder {
     bits_per_value: usize,
+    limits: MiniBlockLimits,
 }
 
 impl ByteStreamSplitEncoder {
     pub fn new(bits_per_value: usize) -> Self {
+        Self::with_limits(bits_per_value, MiniBlockLimits::default())
+    }
+
+    pub(crate) fn with_limits(bits_per_value: usize, limits: MiniBlockLimits) -> Self {
         assert!(
             bits_per_value == 32 || bits_per_value == 64,
             "ByteStreamSplit only supports 32-bit (f32) or 64-bit (f64) values"
         );
-        Self { bits_per_value }
+        Self {
+            bits_per_value,
+            limits,
+        }
     }
 
     fn bytes_per_value(&self) -> usize {
         self.bits_per_value / 8
     }
 
-    fn max_chunk_size(&self) -> usize {
-        // For ByteStreamSplit, total bytes = bytes_per_value * chunk_size
-        // MAX_MINIBLOCK_BYTES = 8186
-        // For f32 (4 bytes): 8186 / 4 = 2046, so max chunk = 1024 (power of 2)
-        // For f64 (8 bytes): 8186 / 8 = 1023, so max chunk = 512 (power of 2)
-        match self.bits_per_value {
-            32 => 1024,
-            64 => 512,
-            _ => unreachable!("ByteStreamSplit only supports 32 or 64 bit values"),
+    fn max_non_last_chunk_size(&self) -> Result<usize> {
+        let max_values_by_bytes = self.limits.max_bytes / self.bytes_per_value() as u64;
+        if max_values_by_bytes < 2 {
+            return Err(lance_core::Error::invalid_input(format!(
+                "miniblock-max-bytes {} is too small for byte-stream-split {}-bit values",
+                self.limits.max_bytes, self.bits_per_value
+            )));
         }
+        let max_values_by_bytes = 1u64 << (u64::BITS - 1 - max_values_by_bytes.leading_zeros());
+        Ok(self
+            .limits
+            .max_non_last_chunk_values()
+            .min(max_values_by_bytes) as usize)
+    }
+
+    fn can_fit_last_chunk(&self, remaining_values: usize) -> bool {
+        remaining_values <= self.limits.max_values as usize
+            && (remaining_values as u128) * (self.bytes_per_value() as u128)
+                <= self.limits.max_bytes as u128
     }
 }
 
@@ -133,10 +150,16 @@ impl MiniBlockCompressor for ByteStreamSplitEncoder {
                 let mut chunks = Vec::new();
                 let data_slice = data.data.as_ref();
                 let mut processed_values = 0usize;
-                let max_chunk_size = self.max_chunk_size();
+                let max_chunk_size = self.max_non_last_chunk_size()?;
 
                 while processed_values < num_values as usize {
-                    let chunk_size = (num_values as usize - processed_values).min(max_chunk_size);
+                    let remaining_values = num_values as usize - processed_values;
+                    let is_last_chunk = self.can_fit_last_chunk(remaining_values);
+                    let chunk_size = if is_last_chunk {
+                        remaining_values
+                    } else {
+                        remaining_values.min(max_chunk_size)
+                    };
                     let chunk_offset = processed_values * bytes_per_value;
 
                     // Create chunk-local byte streams
@@ -150,8 +173,8 @@ impl MiniBlockCompressor for ByteStreamSplitEncoder {
                     }
 
                     let chunk_bytes = chunk_size * bytes_per_value;
-                    let log_num_values = if processed_values + chunk_size == num_values as usize {
-                        0 // Last chunk
+                    let log_num_values = if is_last_chunk {
+                        0
                     } else {
                         chunk_size.ilog2() as u8
                     };

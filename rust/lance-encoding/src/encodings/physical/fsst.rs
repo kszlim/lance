@@ -23,7 +23,7 @@ use crate::{
     data::{BlockInfo, DataBlock, VariableWidthBlock},
     encodings::logical::primitive::{
         fullzip::{PerValueCompressor, PerValueDataBlock},
-        miniblock::{MiniBlockCompressed, MiniBlockCompressor},
+        miniblock::{MiniBlockCompressed, MiniBlockCompressor, MiniBlockLimits},
     },
     format::{
         ProtobufUtils21,
@@ -129,11 +129,19 @@ impl FsstCompressed {
 #[derive(Debug, Default)]
 pub struct FsstMiniBlockEncoder {
     minichunk_size: Option<i64>,
+    limits: MiniBlockLimits,
 }
 
 impl FsstMiniBlockEncoder {
     pub fn new(minichunk_size: Option<i64>) -> Self {
-        Self { minichunk_size }
+        Self::with_limits(minichunk_size, MiniBlockLimits::default())
+    }
+
+    pub(crate) fn with_limits(minichunk_size: Option<i64>, limits: MiniBlockLimits) -> Self {
+        Self {
+            minichunk_size,
+            limits,
+        }
     }
 }
 
@@ -144,8 +152,10 @@ impl MiniBlockCompressor for FsstMiniBlockEncoder {
         let data_block = DataBlock::VariableWidth(compressed.data);
 
         // compress the fsst compressed data using `BinaryMiniBlockEncoder`
-        let binary_compressor = Box::new(BinaryMiniBlockEncoder::new(self.minichunk_size))
-            as Box<dyn MiniBlockCompressor>;
+        let binary_compressor = Box::new(BinaryMiniBlockEncoder::with_limits(
+            self.minichunk_size,
+            self.limits,
+        )) as Box<dyn MiniBlockCompressor>;
 
         let (binary_miniblock_compressed, binary_array_encoding) =
             binary_compressor.compress(data_block)?;
