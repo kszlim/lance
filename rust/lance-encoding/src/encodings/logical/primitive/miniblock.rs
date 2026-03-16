@@ -28,15 +28,15 @@ pub const MAX_MINIBLOCK_BYTES: u64 = 8 * 1024 - 6;
 /// This remains the default when users do not specify any miniblock tuning metadata.
 pub const MAX_MINIBLOCK_VALUES: u64 = 4096;
 /// Maximum miniblock values supported by the current metadata layout in Lance 2.2+.
-pub const MAX_MINIBLOCK_VALUES_V2_2: u64 = 16 * 1024;
+const MAX_MINIBLOCK_VALUES_V2_2: u64 = 16 * 1024;
 /// Maximum serialized miniblock size in Lance 2.1 and earlier.
-pub const MAX_MINIBLOCK_SERIALIZED_BYTES_V2_1: u64 = 32 * 1024;
+const MAX_MINIBLOCK_SERIALIZED_BYTES_V2_1: u64 = 32 * 1024;
 /// Maximum serialized miniblock size in Lance 2.2+.
 ///
 /// The metadata stores the chunk size in 28 bits of 8-byte words.
-pub const MAX_MINIBLOCK_SERIALIZED_BYTES_V2_2: u64 = (1u64 << 28) * 8;
+const MAX_MINIBLOCK_SERIALIZED_BYTES_V2_2: u64 = (1u64 << 28) * 8;
 /// Maximum rep/def buffer size that can be represented in the miniblock header.
-pub const MAX_MINIBLOCK_LEVEL_BUFFER_BYTES: u64 = u16::MAX as u64;
+pub(super) const MAX_MINIBLOCK_LEVEL_BUFFER_BYTES: u64 = u16::MAX as u64;
 
 /// Resolved miniblock tuning limits for a single field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
